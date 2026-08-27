@@ -31,27 +31,36 @@ for i in $(seq 1 "$RUNS"); do
   a0=$(rx_bytes "$CLIENT_IFACE_A"); b0=$(rx_bytes "$CLIENT_IFACE_B"); c0=$(rx_bytes "$CLIENT_IFACE_C")
 
   log="results/run_${i}.log"
+  # Fresh token/ticket files every run - otherwise picoquicdemo persists
+  # 0-RTT session state (demo_token_store.bin) across back-to-back
+  # invocations, and resuming with stale cached transport parameters can
+  # truncate the transfer early while still exiting 0 (seen empirically:
+  # some repeat runs completed in <1s having received only ~5-10% of the
+  # file - not comparable to a full-length run).
+  tok=$(mktemp); tkt=$(mktemp)
   set +e
   ./picoquic/picoquicdemo -M -n test.example.com \
+    -N "$tok" -T "$tkt" \
     -A "${LINK_B_CLIENT_IP}/${IDX_B},${LINK_C_CLIENT_IP}/${IDX_C}" \
     "$SERVER_CANONICAL_IP" "$QUIC_PORT" "$SCENARIO" > "$log" 2>&1
   code=$?
   set -e
+  rm -f "$tok" "$tkt"
 
   a1=$(rx_bytes "$CLIENT_IFACE_A"); b1=$(rx_bytes "$CLIENT_IFACE_B"); c1=$(rx_bytes "$CLIENT_IFACE_C")
   da=$((a1 - a0)); db=$((b1 - b0)); dc=$((c1 - c0))
   total=$((da + db + dc))
 
   if [ "$total" -gt 0 ]; then
-    pa=$(awk "BEGIN{printf \"%.1f\", 100*$da/$total}")
-    pb=$(awk "BEGIN{printf \"%.1f\", 100*$db/$total}")
-    pc=$(awk "BEGIN{printf \"%.1f\", 100*$dc/$total}")
+    pa=$(LC_NUMERIC=C awk "BEGIN{printf \"%.1f\", 100*$da/$total}")
+    pb=$(LC_NUMERIC=C awk "BEGIN{printf \"%.1f\", 100*$db/$total}")
+    pc=$(LC_NUMERIC=C awk "BEGIN{printf \"%.1f\", 100*$dc/$total}")
   else
     pa=0; pb=0; pc=0
   fi
 
-  elapsed=$(grep -oP 'Received \d+ bytes in \K[0-9.]+(?= seconds)' "$log" || echo "")
-  mbps=$(grep -oP 'seconds, \K[0-9.]+(?= Mbps)' "$log" || echo "")
+  elapsed=$(grep -oP 'Received \d+ bytes in \K[0-9.]+(?= seconds)' "$log" | head -1 || echo "")
+  mbps=$(grep -oP 'Received \d+ bytes in [0-9.]+ seconds, \K[0-9.]+(?= Mbps)' "$log" | head -1 || echo "")
 
   row="$i,$da,$db,$dc,$pa,$pb,$pc,$elapsed,$mbps,$code"
   echo "$row" | tee -a "$OUT"
