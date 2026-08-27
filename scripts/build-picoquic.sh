@@ -22,4 +22,4 @@ git log -1 --format='building picoquic at commit %H (%cd)' --date=short
 cmake .
 make -j"$(nproc)"
 
-./picoquicdemo --help 2>&1 | head -5 || true
+./picoquicdemo -h 2>&1 | head -5 || true
