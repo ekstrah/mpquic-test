@@ -48,6 +48,13 @@ This is a single min-RTT/cwnd-based heuristic, not swappable schedulers like TQU
 
 **This means TQUIC bug #2 (CID limit defaulting to 2, starving path 3) likely does not reproduce out of the box** for our 3-link rig — default of 8 covers it. Still verify empirically once we have a real 3-path connection up (Phase 1, step 6/7).
 
+## 5b. Two flags discovered on real hardware, not caught in the Phase 0 pass
+
+- `-n <hostname>`: required when connecting by bare IP. TLS SNI (RFC 6066) can't carry an IP literal, so a bare-IP `server_name` arg gives NULL SNI — which HTTP/3 can't derive `:authority` from, causing `Cannot send GET command for stream(0)`. The hostname is arbitrary (doesn't need to resolve or match a real cert); it just needs to be non-empty.
+- `-w <wwwdir>`: server has no default docroot (`NULL` per `picoquic_config_init()`). Without it, any GET returns 0 bytes even if `gen-testfile.sh` already ran — the file exists, the server just isn't pointed at its folder.
+
+Working single-path baseline: server `./picoquicdemo -w ../www -p 4433`, client `./picoquicdemo -n test.example.com 10.99.0.1 4433 /testfile.bin`.
+
 ## 6. Still open / unresolved from this research pass
 
 - TQUIC bug #1 equivalent (client closing before all paths validate) — did not find explicit "wait for all paths validated" logic in `picoquicdemo.c`'s client shutdown path in this pass. Needs checking directly in the demo client's completion/close code once cloned, or via `picoquic_get_path_quality()` polling before close.
