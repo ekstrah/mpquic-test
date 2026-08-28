@@ -11,6 +11,11 @@
     read directly - picoquicdemo.c includes this same internal header for
     the identical reason, since it's part of the same source tree rather
     than a true external API consumer. */
+#include "picoquic_qlog.h"
+#include "pacer.h"
+
+#define MP_VIDEO_CHUNK_BYTES 1200
+#define MP_VIDEO_TARGET_BPS 10000000ULL
 
 #define MP_MAX_ALT_PATHS 8 /* matches picoquic's own PICOQUIC_NB_PATH_TARGET
     default (picoquic_internal.h) - hardcoded rather than referencing that
@@ -25,11 +30,12 @@ typedef struct st_mp_config_t {
     char path_spec[256];   /* raw -A value, parsed further in Task 3 */
     char cc_algo[32];
     int duration_sec;
+    char qlog_dir[256];    /* empty = no qlog, matching picoquicdemo's -q */
 } mp_config_t;
 
 static void mp_usage(const char* prog) {
-    fprintf(stderr, "Server: %s -p <port> [-G <cc_algo>]\n", prog);
-    fprintf(stderr, "Client: %s -A <path_spec> [-G <cc_algo>] --duration <seconds> <server_ip> <port>\n", prog);
+    fprintf(stderr, "Server: %s -p <port> [-G <cc_algo>] [-q <qlog_dir>]\n", prog);
+    fprintf(stderr, "Client: %s -A <path_spec> [-G <cc_algo>] [-q <qlog_dir>] --duration <seconds> <server_ip> <port>\n", prog);
 }
 
 /* Returns 0 on success, -1 on bad arguments (mp_usage already printed). */
@@ -47,7 +53,7 @@ int mp_parse_args(int argc, char** argv, mp_config_t* config) {
         {0, 0, 0, 0}
     };
 
-    while ((opt = getopt_long(argc, argv, "p:A:G:", long_opts, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "p:A:G:q:", long_opts, NULL)) != -1) {
         switch (opt) {
         case 'p':
             config->port = atoi(optarg);
@@ -58,6 +64,9 @@ int mp_parse_args(int argc, char** argv, mp_config_t* config) {
             break;
         case 'G':
             strncpy(config->cc_algo, optarg, sizeof(config->cc_algo) - 1);
+            break;
+        case 'q':
+            strncpy(config->qlog_dir, optarg, sizeof(config->qlog_dir) - 1);
             break;
         case 'd':
             config->duration_sec = atoi(optarg);
@@ -174,6 +183,36 @@ typedef struct st_mp_client_loop_cb_t {
 
 static uint64_t g_connection_ready_time = 0;
 
+/* Video-like traffic generator: client -> server, via QUIC datagrams
+   (RFC 9221), constant-bitrate. Datagrams are chosen deliberately over a
+   stream here - loss-tolerant, no head-of-line blocking holding up stale
+   data, the standard choice for real-time-media-like traffic. Uses
+   picoquic_queue_datagram_frame, a direct push API (confirmed against
+   picoquic's own picohttp/quicperf.c, which already implements proven
+   CBR pacing this way) rather than the pull-based prepare_datagram
+   callback - simpler, and avoids inventing a new pacing pattern when a
+   working one already exists in picoquic's own codebase. */
+static mp_pacer_t g_video_pacer;
+static int g_video_pacer_started = 0;
+
+static void mp_client_send_video_if_due(picoquic_cnx_t* cnx) {
+    uint64_t now = picoquic_get_quic_time(picoquic_get_quic_ctx(cnx));
+
+    if (!g_video_pacer_started) {
+        mp_pacer_init(&g_video_pacer, now, MP_VIDEO_CHUNK_BYTES, MP_VIDEO_TARGET_BPS);
+        g_video_pacer_started = 1;
+    }
+
+    while (mp_pacer_is_due(&g_video_pacer, now)) {
+        uint8_t chunk[MP_VIDEO_CHUNK_BYTES];
+        memset(chunk, 0xAA, sizeof(chunk)); /* filler payload - content doesn't matter, see spec */
+        picoquic_queue_datagram_frame(cnx, sizeof(chunk), chunk);
+        mp_pacer_advance(&g_video_pacer);
+    }
+
+    picoquic_set_app_wake_time(cnx, mp_pacer_next_time(&g_video_pacer));
+}
+
 static int mp_client_callback(picoquic_cnx_t* cnx, uint64_t stream_id, uint8_t* bytes,
     size_t length, picoquic_call_back_event_t event, void* callback_ctx, void* v_stream_ctx) {
     (void)stream_id; (void)bytes; (void)length; (void)callback_ctx; (void)v_stream_ctx;
@@ -183,6 +222,10 @@ static int mp_client_callback(picoquic_cnx_t* cnx, uint64_t stream_id, uint8_t* 
         g_connection_ready_time = picoquic_get_quic_time(picoquic_get_quic_ctx(cnx));
         fprintf(stderr, "mp_traffic: connection ready at %llu\n",
             (unsigned long long)g_connection_ready_time);
+        mp_client_send_video_if_due(cnx);
+        break;
+    case picoquic_callback_app_wakeup:
+        mp_client_send_video_if_due(cnx);
         break;
     case picoquic_callback_close:
     case picoquic_callback_application_close:
@@ -301,6 +344,9 @@ int mp_run_client(mp_config_t* config) {
        so this call matters most on whichever side is the SERVER, but set
        symmetrically here too in case roles ever reverse). */
     picoquic_set_default_tp_value(quic, picoquic_tp_initial_max_path_id, MP_MAX_ALT_PATHS);
+    if (config->qlog_dir[0] != 0) {
+        picoquic_set_qlog(quic, config->qlog_dir);
+    }
 
     int is_name = 0;
     int ret = picoquic_get_server_address(config->server_ip, config->port, &loop_cb.server_address, &is_name);
@@ -398,6 +444,9 @@ int mp_run_server(mp_config_t* config) {
        picoquic's built-in default, which Task 3's real-hardware test
        showed can be as low as 2 total paths against a foreign peer. */
     picoquic_set_default_tp_value(quic, picoquic_tp_initial_max_path_id, MP_MAX_ALT_PATHS);
+    if (config->qlog_dir[0] != 0) {
+        picoquic_set_qlog(quic, config->qlog_dir);
+    }
 
     picoquic_packet_loop_param_t param;
     memset(&param, 0, sizeof(param));
