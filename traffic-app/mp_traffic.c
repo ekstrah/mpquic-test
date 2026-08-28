@@ -198,7 +198,7 @@ static uint64_t g_connection_ready_time = 0;
 static mp_pacer_t g_video_pacer;
 static int g_video_pacer_started = 0;
 
-static void mp_client_send_video_if_due(picoquic_cnx_t* cnx) {
+static void mp_client_send_video_if_due(picoquic_cnx_t* cnx, int duration_sec) {
     uint64_t now = picoquic_get_quic_time(picoquic_get_quic_ctx(cnx));
 
     if (!g_video_pacer_started) {
@@ -206,29 +206,37 @@ static void mp_client_send_video_if_due(picoquic_cnx_t* cnx) {
         g_video_pacer_started = 1;
     }
 
-    while (mp_pacer_is_due(&g_video_pacer, now)) {
+    uint64_t stop_time = g_connection_ready_time + (uint64_t)duration_sec * 1000000ULL;
+    if (now >= stop_time) {
+        fprintf(stderr, "mp_traffic: duration elapsed, closing\n");
+        picoquic_close(cnx, 0);
+        return;
+    }
+
+    while (mp_pacer_is_due(&g_video_pacer, now) && now < stop_time) {
         uint8_t chunk[MP_VIDEO_CHUNK_BYTES];
         memset(chunk, 0xAA, sizeof(chunk)); /* filler payload - content doesn't matter, see spec */
         picoquic_queue_datagram_frame(cnx, sizeof(chunk), chunk);
         mp_pacer_advance(&g_video_pacer);
     }
 
-    picoquic_set_app_wake_time(cnx, mp_pacer_next_time(&g_video_pacer));
+    picoquic_set_app_wake_time(cnx, mp_pacer_next_time(&g_video_pacer) < stop_time ?
+        mp_pacer_next_time(&g_video_pacer) : stop_time);
 }
 
 static int mp_client_callback(picoquic_cnx_t* cnx, uint64_t stream_id, uint8_t* bytes,
     size_t length, picoquic_call_back_event_t event, void* callback_ctx, void* v_stream_ctx) {
-    (void)stream_id; (void)bytes; (void)length; (void)callback_ctx; (void)v_stream_ctx;
+    (void)stream_id; (void)bytes; (void)length; (void)v_stream_ctx;
 
     switch (event) {
     case picoquic_callback_ready:
         g_connection_ready_time = picoquic_get_quic_time(picoquic_get_quic_ctx(cnx));
         fprintf(stderr, "mp_traffic: connection ready at %llu\n",
             (unsigned long long)g_connection_ready_time);
-        mp_client_send_video_if_due(cnx);
+        mp_client_send_video_if_due(cnx, ((mp_config_t*)callback_ctx)->duration_sec);
         break;
     case picoquic_callback_app_wakeup:
-        mp_client_send_video_if_due(cnx);
+        mp_client_send_video_if_due(cnx, ((mp_config_t*)callback_ctx)->duration_sec);
         break;
     case picoquic_callback_close:
     case picoquic_callback_application_close:
@@ -424,7 +432,7 @@ int mp_run_client(mp_config_t* config) {
 static mp_pacer_t g_control_pacer;
 static int g_control_pacer_started = 0;
 
-static void mp_server_send_control_if_due(picoquic_cnx_t* cnx) {
+static void mp_server_send_control_if_due(picoquic_cnx_t* cnx, int duration_sec) {
     uint64_t now = picoquic_get_quic_time(picoquic_get_quic_ctx(cnx));
 
     if (!g_control_pacer_started) {
@@ -433,14 +441,22 @@ static void mp_server_send_control_if_due(picoquic_cnx_t* cnx) {
         picoquic_mark_active_stream(cnx, MP_CONTROL_STREAM_ID, 1, NULL);
     }
 
-    while (mp_pacer_is_due(&g_control_pacer, now)) {
+    uint64_t stop_time = g_connection_ready_time + (uint64_t)duration_sec * 1000000ULL;
+    if (now >= stop_time) {
+        fprintf(stderr, "mp_traffic: duration elapsed, closing\n");
+        picoquic_close(cnx, 0);
+        return;
+    }
+
+    while (mp_pacer_is_due(&g_control_pacer, now) && now < stop_time) {
         uint8_t chunk[MP_CONTROL_CHUNK_BYTES];
         memset(chunk, 0xBB, sizeof(chunk)); /* filler payload */
         picoquic_add_to_stream(cnx, MP_CONTROL_STREAM_ID, chunk, sizeof(chunk), 0);
         mp_pacer_advance(&g_control_pacer);
     }
 
-    picoquic_set_app_wake_time(cnx, mp_pacer_next_time(&g_control_pacer));
+    picoquic_set_app_wake_time(cnx, mp_pacer_next_time(&g_control_pacer) < stop_time ?
+        mp_pacer_next_time(&g_control_pacer) : stop_time);
 }
 
 /* --- Server connection setup. Confirmed against real picoquicdemo.c
@@ -451,17 +467,17 @@ static void mp_server_send_control_if_due(picoquic_cnx_t* cnx) {
    side, not just simplified for this app's purposes. */
 static int mp_server_callback(picoquic_cnx_t* cnx, uint64_t stream_id, uint8_t* bytes,
     size_t length, picoquic_call_back_event_t event, void* callback_ctx, void* v_stream_ctx) {
-    (void)stream_id; (void)bytes; (void)length; (void)callback_ctx; (void)v_stream_ctx;
+    (void)stream_id; (void)bytes; (void)length; (void)v_stream_ctx;
 
     switch (event) {
     case picoquic_callback_ready:
         g_connection_ready_time = picoquic_get_quic_time(picoquic_get_quic_ctx(cnx));
         fprintf(stderr, "mp_traffic: server sees connection ready at %llu\n",
             (unsigned long long)g_connection_ready_time);
-        mp_server_send_control_if_due(cnx);
+        mp_server_send_control_if_due(cnx, ((mp_config_t*)callback_ctx)->duration_sec);
         break;
     case picoquic_callback_app_wakeup:
-        mp_server_send_control_if_due(cnx);
+        mp_server_send_control_if_due(cnx, ((mp_config_t*)callback_ctx)->duration_sec);
         break;
     case picoquic_callback_close:
     case picoquic_callback_application_close:
