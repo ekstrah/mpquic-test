@@ -3,6 +3,11 @@
 #include <string.h>
 #include <unistd.h>
 #include <getopt.h>
+#include "picoquic.h"
+#include "picoquic_utils.h"
+#include "picoquic_packet_loop.h"
+
+#define MP_MAX_ALT_PATHS PICOQUIC_NB_PATH_TARGET
 
 typedef struct st_mp_config_t {
     int is_server;
@@ -68,6 +73,250 @@ int mp_parse_args(int argc, char** argv, mp_config_t* config) {
     return 0;
 }
 
+/* --- -A path-spec parser, copied from picoquicdemo.c's
+   picoquic_parse_client_multipath_config() - that function is defined
+   locally in picoquicdemo.c, not exported by the picoquic library, so it
+   can't be linked against and must be copied to guarantee identical
+   parsing behavior to what's already validated all session. */
+static char* mp_strsep(char** stringp, const char* delim) {
+    return strsep(stringp, delim);
+}
+
+static int mp_parse_client_multipath_config(char* mp_config, int* src_if,
+    struct sockaddr_storage* alt_client_ip, struct sockaddr_storage* alt_server_ip,
+    int* nb_alt_paths, struct sockaddr_storage* default_server_ip) {
+    int ret = 0;
+    size_t config_len = strlen(mp_config) + 1;
+    int valid_new_entry = 0;
+    char *token, *token2, *end_ptr, *alt_path, *ptr, *str;
+    uint16_t server_port = (default_server_ip->ss_family == AF_INET) ?
+        ((struct sockaddr_in*)default_server_ip)->sin_port :
+        ((struct sockaddr_in6*)default_server_ip)->sin6_port;
+    str = malloc(sizeof(char) * config_len);
+    alt_path = malloc(sizeof(char) * config_len);
+    if (str == NULL || alt_path == NULL) {
+        return -1;
+    }
+    memcpy(str, mp_config, sizeof(char) * config_len);
+    ptr = str;
+
+    while ((token = mp_strsep(&str, ","))) {
+        struct sockaddr_storage ip;
+        valid_new_entry = 0;
+        memcpy(alt_path, token, sizeof(char) * (strnlen(token, config_len - 1) + 1));
+
+        if ((token2 = mp_strsep(&token, "/")) != 0) {
+            if (picoquic_store_text_addr(&ip, token2, 0) == 0) {
+                memcpy(alt_client_ip + (*nb_alt_paths), &ip, sizeof(struct sockaddr_storage));
+                if ((token2 = mp_strsep(&token, "/")) == NULL) {
+                    *(src_if + (*nb_alt_paths)) = 0;
+                    memcpy(alt_server_ip + (*nb_alt_paths), default_server_ip, sizeof(struct sockaddr_storage));
+                    valid_new_entry = 1;
+                } else {
+                    *(src_if + (*nb_alt_paths)) = (int)strtol(token2, &end_ptr, 10);
+                    if (*end_ptr) {
+                        fprintf(stderr, "mp_traffic: unexpected interface index %s, skipping path %s\n", token2, alt_path);
+                    } else if (token) {
+                        if (picoquic_store_text_addr(&ip, token, server_port) == 0) {
+                            memcpy(alt_server_ip + (*nb_alt_paths), &ip, sizeof(struct sockaddr_storage));
+                            valid_new_entry = 1;
+                        }
+                    } else {
+                        memcpy(alt_server_ip + (*nb_alt_paths), default_server_ip, sizeof(struct sockaddr_storage));
+                        valid_new_entry = 1;
+                    }
+                }
+            }
+        }
+
+        if (valid_new_entry == 1 && alt_client_ip[*nb_alt_paths].ss_family == alt_server_ip[*nb_alt_paths].ss_family) {
+            (*nb_alt_paths)++;
+            if (*nb_alt_paths >= PICOQUIC_NB_PATH_TARGET) {
+                break;
+            }
+        }
+    }
+    free(alt_path);
+    free(ptr);
+    return ret;
+}
+
+/* --- Client connection setup and multipath driving. Adapted from
+   picoquicdemo.c's client_loop_cb_t / client_loop_cb() /
+   client_create_additional_path(), trimmed of the migration/key-update/
+   quicperf branches this app doesn't need. Two separate callbacks are
+   involved, easy to conflate: mp_client_callback (below) handles
+   per-CONNECTION events (ready/close, and traffic generation in later
+   tasks) via picoquic_set_callback; mp_client_loop_cb handles the
+   packet-loop's own socket-level events and is where multipath path
+   creation is actually driven from - picoquicdemo.c does the same split. */
+typedef struct st_mp_client_loop_cb_t {
+    picoquic_cnx_t* cnx_client;
+    int multipath_initiated;
+    int multipath_probe_done;
+    struct sockaddr_storage server_address;
+    struct sockaddr_storage client_alt_address[MP_MAX_ALT_PATHS];
+    struct sockaddr_storage server_alt_address[MP_MAX_ALT_PATHS];
+    int client_alt_if[MP_MAX_ALT_PATHS];
+    int client_alt_state[MP_MAX_ALT_PATHS];
+    int nb_alt_paths;
+    uint16_t alt_port;
+} mp_client_loop_cb_t;
+
+static uint64_t g_connection_ready_time = 0;
+
+static int mp_client_callback(picoquic_cnx_t* cnx, uint64_t stream_id, uint8_t* bytes,
+    size_t length, picoquic_call_back_event_t event, void* callback_ctx, void* v_stream_ctx) {
+    (void)stream_id; (void)bytes; (void)length; (void)callback_ctx; (void)v_stream_ctx;
+
+    switch (event) {
+    case picoquic_callback_ready:
+        g_connection_ready_time = picoquic_get_quic_time(picoquic_get_quic_ctx(cnx));
+        fprintf(stderr, "mp_traffic: connection ready at %llu\n",
+            (unsigned long long)g_connection_ready_time);
+        break;
+    case picoquic_callback_close:
+    case picoquic_callback_application_close:
+        fprintf(stderr, "mp_traffic: connection closed\n");
+        break;
+    default:
+        break;
+    }
+    return 0;
+}
+
+static int mp_client_create_additional_path(picoquic_cnx_t* cnx, mp_client_loop_cb_t* cb_ctx) {
+    int ret = 0;
+    int need_to_wait = 0;
+
+    for (int i = 0; i < cb_ctx->nb_alt_paths; i++) {
+        if (cb_ctx->client_alt_state[i] != 0) {
+            continue;
+        }
+
+        cb_ctx->client_alt_state[i] = 1;
+        ret = picoquic_probe_new_path_ex(cb_ctx->cnx_client,
+            (struct sockaddr*)&cb_ctx->server_alt_address[i],
+            (struct sockaddr*)&cb_ctx->client_alt_address[i],
+            cb_ctx->client_alt_if[i],
+            picoquic_get_quic_time(picoquic_get_quic_ctx(cnx)), 0);
+
+        if (ret != 0) {
+            if (ret == PICOQUIC_ERROR_PATH_ID_BLOCKED ||
+                ret == PICOQUIC_ERROR_PATH_CID_BLOCKED ||
+                ret == PICOQUIC_ERROR_PATH_NOT_READY) {
+                cb_ctx->client_alt_state[i] = 0;
+                need_to_wait = 1;
+                ret = 0;
+            } else {
+                fprintf(stderr, "mp_traffic: probe new path failed, code %d\n", ret);
+            }
+        } else {
+            fprintf(stderr, "mp_traffic: new path added, total paths %d\n", cb_ctx->cnx_client->nb_paths);
+        }
+    }
+
+    if (!need_to_wait) {
+        cb_ctx->multipath_probe_done = 1;
+    }
+    return ret;
+}
+
+static int mp_client_loop_cb(picoquic_quic_t* quic, picoquic_packet_loop_cb_enum cb_mode,
+    void* callback_ctx, void* callback_arg) {
+    int ret = 0;
+    mp_client_loop_cb_t* cb_ctx = (mp_client_loop_cb_t*)callback_ctx;
+    (void)quic;
+
+    switch (cb_mode) {
+    case picoquic_packet_loop_ready: {
+        picoquic_packet_loop_options_t* options = (picoquic_packet_loop_options_t*)callback_arg;
+        options->provide_alt_port = 1;
+        break;
+    }
+    case picoquic_packet_loop_after_receive:
+        if (cb_ctx->cnx_client->is_multipath_enabled) {
+            if (cb_ctx->multipath_initiated == 0) {
+                int is_already_allowed = 0;
+                cb_ctx->multipath_initiated = 1;
+                if (picoquic_subscribe_new_path_allowed(cb_ctx->cnx_client, &is_already_allowed) == 0) {
+                    if (is_already_allowed) {
+                        ret = mp_client_create_additional_path(cb_ctx->cnx_client, cb_ctx);
+                    }
+                }
+            }
+            if (!cb_ctx->multipath_probe_done && cb_ctx->cnx_client->is_notified_that_path_is_allowed) {
+                ret = mp_client_create_additional_path(cb_ctx->cnx_client, cb_ctx);
+            }
+        }
+        break;
+    case picoquic_packet_loop_alt_port:
+        cb_ctx->alt_port = *((uint16_t*)callback_arg);
+        break;
+    default:
+        break;
+    }
+
+    return ret;
+}
+
+int mp_run_client(mp_config_t* config) {
+    mp_client_loop_cb_t loop_cb;
+    memset(&loop_cb, 0, sizeof(loop_cb));
+
+    picoquic_quic_t* quic = picoquic_create(8, NULL, NULL, NULL, "mp_traffic", NULL, NULL, NULL, NULL, NULL,
+        picoquic_current_time(), NULL, NULL, NULL, 0);
+    if (quic == NULL) {
+        fprintf(stderr, "mp_traffic: could not create quic context\n");
+        return -1;
+    }
+
+    picoquic_set_default_congestion_algorithm_by_name(quic, config->cc_algo);
+    picoquic_set_default_multipath_option(quic, 1);
+
+    int is_name = 0;
+    int ret = picoquic_get_server_address(config->server_ip, config->port, &loop_cb.server_address, &is_name);
+    if (ret != 0) {
+        fprintf(stderr, "mp_traffic: could not resolve server address %s\n", config->server_ip);
+        return -1;
+    }
+
+    picoquic_cnx_t* cnx = picoquic_create_cnx(quic, picoquic_null_connection_id, picoquic_null_connection_id,
+        (struct sockaddr*)&loop_cb.server_address, picoquic_current_time(), 0, "mp-traffic.test", "mp-traffic", 1);
+    if (cnx == NULL) {
+        fprintf(stderr, "mp_traffic: could not create connection\n");
+        return -1;
+    }
+
+    picoquic_set_callback(cnx, mp_client_callback, config);
+
+    ret = picoquic_start_client_cnx(cnx);
+    if (ret != 0) {
+        fprintf(stderr, "mp_traffic: could not start connection\n");
+        return -1;
+    }
+
+    if (config->path_spec[0] != 0) {
+        mp_parse_client_multipath_config(config->path_spec, loop_cb.client_alt_if,
+            loop_cb.client_alt_address, loop_cb.server_alt_address, &loop_cb.nb_alt_paths,
+            &loop_cb.server_address);
+    }
+    loop_cb.cnx_client = cnx;
+
+    picoquic_packet_loop_param_t param;
+    memset(&param, 0, sizeof(param));
+    param.local_af = loop_cb.server_address.ss_family;
+    if (config->path_spec[0] != 0) {
+        param.local_port = (uint16_t)picoquic_uniform_random(30000) + 20000;
+        param.extra_socket_required = 1;
+    }
+
+    ret = picoquic_packet_loop_v2(quic, &param, mp_client_loop_cb, &loop_cb);
+
+    picoquic_free(quic);
+    return ret;
+}
+
 int main(int argc, char** argv) {
     mp_config_t config;
     if (mp_parse_args(argc, argv, &config) != 0) {
@@ -76,9 +325,8 @@ int main(int argc, char** argv) {
 
     if (config.is_server) {
         printf("server mode: port=%d cc=%s\n", config.port, config.cc_algo);
+        return 0; /* server connection setup added in Task 4 */
     } else {
-        printf("client mode: server=%s port=%d path_spec=%s cc=%s duration=%d\n",
-            config.server_ip, config.port, config.path_spec, config.cc_algo, config.duration_sec);
+        return mp_run_client(&config);
     }
-    return 0;
 }
