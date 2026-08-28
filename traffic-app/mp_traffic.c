@@ -680,6 +680,20 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    /* Both picoquic_get_congestion_algorithm and
+       picoquic_set_default_congestion_algorithm_by_name look up names in
+       a process-wide registry (picoquic_congestion_control_algorithms in
+       quicctx.c) that starts NULL/empty - nothing populates it
+       automatically. picoquicdemo.c calls this exact function at the top
+       of its own main() (picoquicfirst/picoquicdemo.c) before parsing
+       -G; this app never did, which meant every -G value including the
+       default "cubic" silently resolved to NULL and every run this
+       session had congestion control fully disabled, not "cubic" - the
+       new validation added after the final review didn't just add a
+       safety check, it surfaced this pre-existing bug immediately by
+       rejecting the very first run. */
+    picoquic_register_all_congestion_control_algorithms();
+
     if (config.is_server) {
         return mp_run_server(&config);
     } else {
