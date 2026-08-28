@@ -32,10 +32,11 @@ for cc in "${SWEEP_CC_LIST[@]}"; do
   a0=$(rx_bytes "$CLIENT_IFACE_A"); b0=$(rx_bytes "$CLIENT_IFACE_B"); c0=$(rx_bytes "$CLIENT_IFACE_C")
 
   log="results/run_${cc}.log"
+  mkdir -p "qlogs_client/$cc"
   tok=$(mktemp); tkt=$(mktemp)
   set +e
   ./picoquic/picoquicdemo -M -n test.example.com \
-    -N "$tok" -T "$tkt" \
+    -N "$tok" -T "$tkt" -q "qlogs_client/$cc" \
     -A "${LINK_B_CLIENT_IP}/${IDX_B},${LINK_C_CLIENT_IP}/${IDX_C}" \
     "$SERVER_CANONICAL_IP" "$QUIC_PORT" /testfile.bin > "$log" 2>&1
   code=$?

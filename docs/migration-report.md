@@ -58,7 +58,9 @@ A specific fix hypothesis was tested and refuted: picoquic uses UDP GSO to batch
 
 Across every repeated-run test this session — 5MB and 200MB, under both BBR and CUBIC — a consistent minority of runs (roughly 1-in-4 to 1-in-5) complete in under a second having transferred only a few hundred KB to a couple MB, instead of the full file, while still reporting `exit_code = 0`. First suspected to be 0-RTT session-ticket reuse across back-to-back client invocations (picoquic persists `demo_token_store.bin`/ticket state by default, and a resumed connection using stale cached transport parameters could plausibly truncate early) — fixed by passing fresh `-N`/`-T` token/ticket files per run via `mktemp`. **The pattern persisted even with fresh ticket files each time**, ruling that theory out as the sole cause.
 
-This is the same *symptom class* as the TQUIC "client closes before all paths validate" bug flagged for checking back in Phase 0, but it has not been root-caused in picoquic specifically — see §5.
+This is a different bug class from the TQUIC "client closes before all paths validate" symptom originally suspected — it happens mid-transfer after multipath negotiation already succeeded, not during setup. A sweep run (20MB file, all 8 CC algorithms) surfaced a real lead: comparing truncation across two independent sweeps (5MB and 20MB), three algorithms - `newreno`, `dcubic`, `bbr1` - truncated in **both** runs, while `cubic`, `fast`, `prague`, `c4` completed cleanly in **both**. That's not what a purely random per-connection race would produce; it points at something correlated with which CC algorithm is running.
+
+The client log from a `bbr1` truncation (20MB sweep) confirms this isn't a timeout or crash - it's picoquic itself detecting a fault: `Connection ends with local error 0xa (protocol violation)` after 1.5MB of the 20MB file, with multipath negotiation having already reported `Enable multipath: Success.` and all 3 paths carrying packets. Checking `picoquic/frames.c` for where `PICOQUIC_TRANSPORT_PROTOCOL_VIOLATION` gets raised turned up a specific, plausible mechanism: a path-scoped `NEW_CONNECTION_ID` frame referencing a path ID the peer isn't yet authorized to use (`path_id` exceeding `max_path_id_local`) - and picoquic's own source comment on this check notes "out-of-order arrival might cause the peer's max_path_id logic to behave unexpectedly," i.e. a plausible race in issuing connection IDs for the 2nd/3rd path that could easily be timing/pacing-sensitive, which would explain the clustering on the more conservative, slower-ramping algorithms. **Not confirmed** - this requires a client-side qlog to verify against the actual frame sequence, which isn't currently captured (only the server has `-q`; see §5 item 1).
 
 ### 4.4 Sweep harness bugs (Phase 2)
 
@@ -82,13 +84,26 @@ The most recent completed sweep (5MB file, all 8 registered CC algorithms, singl
 | bbr1 | 2.8 | 31.4 / 18.6 / 50.1 | **truncated** (0.5MB total, 0.79s) |
 | c4 | 6.2 | 33.3 / 32.8 / 33.9 | full transfer |
 
-Three of eight rows are truncated runs (§4.3) and should not be read as real results for those algorithms — they need a clean re-run. Among the five valid rows, CUBIC stands out sharply in both throughput (22.7Mbps vs. 4.7-6.9Mbps for everything else) and distribution (only algorithm showing real Link-A dominance; the rest cluster in a balanced-but-slower pattern). This is one run per algorithm — not statistically confident yet.
+A second sweep at 20MB (same 8 algorithms, single run each) followed:
 
-A 20MB-file sweep is running as of this writing, both to get more data per algorithm and to see whether the throughput/distribution patterns above hold at a larger transfer size or shift (as BBR's did between 5MB and 200MB earlier).
+| CC | Mbps | Link A / B / C share | Notes |
+|---|---|---|---|
+| newreno | 3.6 | 40.0 / 11.6 / 48.4 | **truncated** (0.75MB total, 0.97s) |
+| cubic | 12.3 | 45.0 / 33.5 / 21.5 | full transfer |
+| dcubic | 4.3 | 25.7 / 34.5 / 39.8 | **truncated** (1.76MB total, 2.70s) |
+| fast | 4.3 | 22.7 / 45.0 / 32.3 | full transfer |
+| bbr | 5.3 | 35.9 / 13.3 / 50.8 | **truncated** (0.75MB total, 0.75s) - full at 5MB |
+| prague | 8.4 | 21.1 / 50.8 / 28.1 | full transfer |
+| bbr1 | 5.4 | 39.6 / 18.6 / 41.9 | **truncated** (1.96MB total, 2.27s) - protocol error, see below |
+| c4 | 5.8 | 31.7 / 34.7 / 33.6 | full transfer |
+
+Four of eight rows truncated this time, and comparing the two sweeps directly is the important part: **`newreno`, `dcubic`, and `bbr1` truncated in both runs; `cubic`, `fast`, `prague`, `c4` completed cleanly in both.** Only `bbr` is inconsistent (full at 5MB, truncated at 20MB). That pattern - not scattered randomly across all 8, but repeating on the same three algorithms - is the basis for the sharpened root-cause lead in §4.3 (a likely multipath connection-ID/path-ID race, evidenced by an actual `PROTOCOL_VIOLATION (0xa)` in the `bbr1` client log, not a timeout or crash).
+
+Two more observations from the valid rows, both non-obvious and worth following up with repeats before trusting them: CUBIC's Link-A dominance is markedly less extreme at 20MB (45.0/33.5/21.5) than the 5MB-repeat average (69.6/11.2/19.3) - the other paths may catch up more over a longer transfer even under an aggressive CC. And `fast` (B-leaning both sizes: 41→45%) and `c4` (balanced both sizes: ~33/33/34 both times) show the same shape at both file sizes, suggesting a real per-algorithm property rather than single-run noise - though every result here is still n=1 or n=2, not statistically confident.
 
 **Open items that need further investigation, roughly in priority order:**
 
-1. **Root-cause the intermittent truncated-run pattern (§4.3).** Not yet confirmed whether this is a multipath path-validation race (the TQUIC-bug-1 analog), a picoquic-side timeout/retry quirk, or something else — needs a client log captured from a truncated run compared line-by-line against a successful one, and ideally a qlog trace of a truncated connection specifically.
+1. **Confirm the multipath path-ID race hypothesis for the truncated-run pattern (§4.3).** The candidate mechanism (a `NEW_CONNECTION_ID` frame referencing an unauthorized path ID, per `picoquic/frames.c`) is plausible and matches the CC-clustering evidence, but unconfirmed - needs a client-side qlog (add `-q` to the client's picoquicdemo invocation, not currently captured) from a `newreno`/`dcubic`/`bbr1` truncation to verify against the actual frame sequence.
 2. **Confirm BBR's exact cwnd-stunting mechanism (§4.2).** The RTT-jitter-during-STARTUP theory is plausible and consistent with the observed cwnd data, but not confirmed against picoquic's actual `bbr.c` source or a qlog trace of the STARTUP→PROBE_BW transition timing. The `fq`/GSO hypothesis was tested and refuted; this is the remaining live hypothesis, untested.
 3. **Repeat the sweep for statistical confidence.** Every result so far is n=1 or n=10 for exactly two algorithms (BBR, CUBIC) — the other six have never been repeated. Given the sweep now completes in ~75 seconds, repeating it several times is cheap and should happen before drawing conclusions about any algorithm other than BBR/CUBIC.
 4. **Investigate `fast`'s Link-B-favoring split** (41.2% to B, the only non-BBR/CUBIC result that doesn't cluster near-even) — could be a real property of that algorithm or could be within single-run noise; needs repeats to tell.
