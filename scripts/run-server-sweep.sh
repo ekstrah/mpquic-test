@@ -15,7 +15,14 @@ mkdir -p results qlogs
 for cc in "${SWEEP_CC_LIST[@]}"; do
   echo "=== CC=$cc, window=${SWEEP_WINDOW_SEC}s ==="
   mkdir -p "qlogs/$cc"
-  ./picoquic/picoquicdemo -w www -p "$QUIC_PORT" -M -q "qlogs/$cc" -G "$cc" \
+  # picoquicdemo's default cert/key path (certs/cert.pem) is relative to
+  # its OWN working directory at run time, not to the binary's location -
+  # it only exists under picoquic/certs/, so the binary must be launched
+  # with picoquic/ as cwd (matching every manual invocation this session)
+  # or it fails silently during setup (ret=-1, no further output).
+  # `exec` inside the subshell replaces it with picoquicdemo itself, so
+  # $! below is picoquicdemo's real PID, not a wrapper shell's.
+  ( cd picoquic && exec ./picoquicdemo -w ../www -p "$QUIC_PORT" -M -q "../qlogs/$cc" -G "$cc" ) \
     > "results/server_${cc}.log" 2>&1 &
   server_pid=$!
   sleep "$SWEEP_WINDOW_SEC"
