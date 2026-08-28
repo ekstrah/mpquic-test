@@ -411,6 +411,38 @@ int mp_run_client(mp_config_t* config) {
     return ret;
 }
 
+/* Control-like traffic generator: server -> client, on a regular
+   reliable QUIC stream (not a datagram) - control commands need
+   ordering/reliability that a datagram doesn't provide, the opposite
+   tradeoff from the video-like traffic in Task 5. Same pacer module,
+   same CBR approach, picoquic_add_to_stream instead of
+   picoquic_queue_datagram_frame. */
+#define MP_CONTROL_CHUNK_BYTES 125
+#define MP_CONTROL_TARGET_BPS 1000000ULL
+#define MP_CONTROL_STREAM_ID 1 /* server-initiated bidirectional stream */
+
+static mp_pacer_t g_control_pacer;
+static int g_control_pacer_started = 0;
+
+static void mp_server_send_control_if_due(picoquic_cnx_t* cnx) {
+    uint64_t now = picoquic_get_quic_time(picoquic_get_quic_ctx(cnx));
+
+    if (!g_control_pacer_started) {
+        mp_pacer_init(&g_control_pacer, now, MP_CONTROL_CHUNK_BYTES, MP_CONTROL_TARGET_BPS);
+        g_control_pacer_started = 1;
+        picoquic_mark_active_stream(cnx, MP_CONTROL_STREAM_ID, 1, NULL);
+    }
+
+    while (mp_pacer_is_due(&g_control_pacer, now)) {
+        uint8_t chunk[MP_CONTROL_CHUNK_BYTES];
+        memset(chunk, 0xBB, sizeof(chunk)); /* filler payload */
+        picoquic_add_to_stream(cnx, MP_CONTROL_STREAM_ID, chunk, sizeof(chunk), 0);
+        mp_pacer_advance(&g_control_pacer);
+    }
+
+    picoquic_set_app_wake_time(cnx, mp_pacer_next_time(&g_control_pacer));
+}
+
 /* --- Server connection setup. Confirmed against real picoquicdemo.c
    source that the server side needs no equivalent of the client's
    path-probing/driving logic - multipath path validation on accept is
@@ -426,6 +458,10 @@ static int mp_server_callback(picoquic_cnx_t* cnx, uint64_t stream_id, uint8_t* 
         g_connection_ready_time = picoquic_get_quic_time(picoquic_get_quic_ctx(cnx));
         fprintf(stderr, "mp_traffic: server sees connection ready at %llu\n",
             (unsigned long long)g_connection_ready_time);
+        mp_server_send_control_if_due(cnx);
+        break;
+    case picoquic_callback_app_wakeup:
+        mp_server_send_control_if_due(cnx);
         break;
     case picoquic_callback_close:
     case picoquic_callback_application_close:
