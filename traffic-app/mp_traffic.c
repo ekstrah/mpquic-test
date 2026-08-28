@@ -186,6 +186,15 @@ typedef struct st_mp_client_loop_cb_t {
 
 static uint64_t g_connection_ready_time = 0;
 
+/* Set by the connection-level close callback (mp_client_callback /
+   mp_server_callback - only one runs per process), read by this side's
+   packet-loop callback to request clean termination. Needed because
+   closing the QUIC connection (picoquic_close) does not by itself stop
+   picoquic_packet_loop_v2's socket loop - confirmed against picoquic's
+   own sockloop.c, whose main loop only exits when a loop_callback
+   returns a nonzero ret; there is no automatic exit-on-disconnect. */
+static int g_should_exit = 0;
+
 /* Video-like traffic generator: client -> server, via QUIC datagrams
    (RFC 9221), constant-bitrate. Datagrams are chosen deliberately over a
    stream here - loss-tolerant, no head-of-line blocking holding up stale
@@ -241,6 +250,7 @@ static int mp_client_callback(picoquic_cnx_t* cnx, uint64_t stream_id, uint8_t* 
     case picoquic_callback_close:
     case picoquic_callback_application_close:
         fprintf(stderr, "mp_traffic: connection closed\n");
+        g_should_exit = 1;
         break;
     default:
         break;
@@ -307,8 +317,14 @@ static int mp_client_loop_cb(picoquic_quic_t* quic, picoquic_packet_loop_cb_enum
     case picoquic_packet_loop_ready: {
         picoquic_packet_loop_options_t* options = (picoquic_packet_loop_options_t*)callback_arg;
         options->provide_alt_port = 1;
+        options->do_time_check = 1;
         break;
     }
+    case picoquic_packet_loop_time_check:
+        if (g_should_exit) {
+            ret = PICOQUIC_NO_ERROR_TERMINATE_PACKET_LOOP;
+        }
+        break;
     case picoquic_packet_loop_after_receive:
         if (cb_ctx->cnx_client->is_multipath_enabled) {
             if (cb_ctx->multipath_initiated == 0) {
@@ -482,11 +498,39 @@ static int mp_server_callback(picoquic_cnx_t* cnx, uint64_t stream_id, uint8_t* 
     case picoquic_callback_close:
     case picoquic_callback_application_close:
         fprintf(stderr, "mp_traffic: server sees connection closed\n");
+        g_should_exit = 1;
         break;
     default:
         break;
     }
     return 0;
+}
+
+/* Unlike the client, the server had no packet-loop callback at all
+   (picoquic_packet_loop_v2 was called with NULL, NULL) - fine while the
+   only stop condition was manual Ctrl-C, but picoquic_close() alone
+   never makes picoquic_packet_loop_v2 return, so once mp_server_callback
+   sets g_should_exit this is the hook that actually terminates the loop. */
+static int mp_server_loop_cb(picoquic_quic_t* quic, picoquic_packet_loop_cb_enum cb_mode,
+    void* callback_ctx, void* callback_arg) {
+    int ret = 0;
+    (void)quic; (void)callback_ctx; (void)callback_arg;
+
+    switch (cb_mode) {
+    case picoquic_packet_loop_ready: {
+        picoquic_packet_loop_options_t* options = (picoquic_packet_loop_options_t*)callback_arg;
+        options->do_time_check = 1;
+        break;
+    }
+    case picoquic_packet_loop_time_check:
+        if (g_should_exit) {
+            ret = PICOQUIC_NO_ERROR_TERMINATE_PACKET_LOOP;
+        }
+        break;
+    default:
+        break;
+    }
+    return ret;
 }
 
 int mp_run_server(mp_config_t* config) {
@@ -525,7 +569,7 @@ int mp_run_server(mp_config_t* config) {
     memset(&param, 0, sizeof(param));
     param.local_port = config->port;
 
-    int ret = picoquic_packet_loop_v2(quic, &param, NULL, NULL);
+    int ret = picoquic_packet_loop_v2(quic, &param, mp_server_loop_cb, NULL);
 
     picoquic_free(quic);
     return ret;
