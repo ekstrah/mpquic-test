@@ -70,7 +70,7 @@ Root cause in TQUIC: all built-in schedulers funnel through one shared `on_selec
 - Statistical confidence: the original sweep was one run per (scheduler × CC) combo; repeat for averages/variance once the picoquic harness is working.
 - Custom (non-built-in) congestion-control algorithms and/or schedulers were out of scope for TQUIC without forking it (`build_congestion_controller`/`build_multipath_scheduler` were closed factories over private modules with no plugin API). **Check picoquic's extension points for this before assuming a fork is needed** — it may expose CC/scheduler as a pluggable interface already, which would remove an entire phase of work.
 - Handover-burst modeling on the Mobile link (latency/loss spikes) — explicitly deferred in the original spec, still not modeled.
-- Replicating the source paper's actual traffic model (10 Mbps downlink video-like stream + 1 Mbps uplink control-like stream) instead of a single bulk-file transfer — was out of scope for Phase 1, still not done.
+- ~~Replicating the source paper's actual traffic model (10 Mbps downlink video-like stream + 1 Mbps uplink control-like stream) instead of a single bulk-file transfer — was out of scope for Phase 1.~~ **Done** — see `docs/migration-report.md` §5 (`mp_traffic`, `traffic-app/`).
 
 ## Suggested first steps in the new project
 
