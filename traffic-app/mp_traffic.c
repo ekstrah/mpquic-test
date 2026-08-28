@@ -16,6 +16,9 @@
 
 #define MP_VIDEO_CHUNK_BYTES 1200
 #define MP_VIDEO_TARGET_BPS 10000000ULL
+#define MP_MAX_DATAGRAM_FRAME_SIZE 1400 /* comfortably above
+    MP_VIDEO_CHUNK_BYTES plus frame overhead, within this rig's observed
+    MTU range (~1252-1440 seen throughout this project) */
 
 #define MP_MAX_ALT_PATHS 8 /* matches picoquic's own PICOQUIC_NB_PATH_TARGET
     default (picoquic_internal.h) - hardcoded rather than referencing that
@@ -344,6 +347,15 @@ int mp_run_client(mp_config_t* config) {
        so this call matters most on whichever side is the SERVER, but set
        symmetrically here too in case roles ever reverse). */
     picoquic_set_default_tp_value(quic, picoquic_tp_initial_max_path_id, MP_MAX_ALT_PATHS);
+    /* Datagram extension (RFC 9221) isn't enabled just by calling
+       picoquic_queue_datagram_frame - it needs this transport parameter
+       set, or the peer rejects incoming datagram frames outright with a
+       FRAME_ENCODING_ERROR (confirmed on real hardware: server-side qlog
+       showed exactly this, trigger_frame_type "datagram", closing the
+       connection). Same shape of gap as max_path_id above - a feature
+       that needs an explicit transport-parameter opt-in, not just using
+       the sending API. */
+    picoquic_set_default_tp_value(quic, picoquic_tp_max_datagram_frame_size, MP_MAX_DATAGRAM_FRAME_SIZE);
     if (config->qlog_dir[0] != 0) {
         picoquic_set_qlog(quic, config->qlog_dir);
     }
@@ -444,6 +456,15 @@ int mp_run_server(mp_config_t* config) {
        picoquic's built-in default, which Task 3's real-hardware test
        showed can be as low as 2 total paths against a foreign peer. */
     picoquic_set_default_tp_value(quic, picoquic_tp_initial_max_path_id, MP_MAX_ALT_PATHS);
+    /* Datagram extension (RFC 9221) isn't enabled just by calling
+       picoquic_queue_datagram_frame - it needs this transport parameter
+       set, or the peer rejects incoming datagram frames outright with a
+       FRAME_ENCODING_ERROR (confirmed on real hardware: server-side qlog
+       showed exactly this, trigger_frame_type "datagram", closing the
+       connection). Same shape of gap as max_path_id above - a feature
+       that needs an explicit transport-parameter opt-in, not just using
+       the sending API. */
+    picoquic_set_default_tp_value(quic, picoquic_tp_max_datagram_frame_size, MP_MAX_DATAGRAM_FRAME_SIZE);
     if (config->qlog_dir[0] != 0) {
         picoquic_set_qlog(quic, config->qlog_dir);
     }
