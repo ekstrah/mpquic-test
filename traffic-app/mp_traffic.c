@@ -91,6 +91,19 @@ int mp_parse_args(int argc, char** argv, mp_config_t* config) {
         config->port = atoi(argv[optind + 1]);
     }
 
+    /* atoi() on garbage or omitted values yields 0, and a negative
+       --duration wraps via uint64_t arithmetic at the send sites - both
+       happened to fail benign (immediate close) rather than being
+       rejected, which is safe by accident, not by design. */
+    if (config->duration_sec <= 0) {
+        fprintf(stderr, "mp_traffic: --duration must be a positive number of seconds\n");
+        return -1;
+    }
+    if (config->port <= 0 || config->port > 65535) {
+        fprintf(stderr, "mp_traffic: port must be between 1 and 65535\n");
+        return -1;
+    }
+
     return 0;
 }
 
@@ -152,7 +165,14 @@ static int mp_parse_client_multipath_config(char* mp_config, int* src_if,
 
         if (valid_new_entry == 1 && alt_client_ip[*nb_alt_paths].ss_family == alt_server_ip[*nb_alt_paths].ss_family) {
             (*nb_alt_paths)++;
-            if (*nb_alt_paths >= PICOQUIC_NB_PATH_TARGET) {
+            /* Bound against MP_MAX_ALT_PATHS, not PICOQUIC_NB_PATH_TARGET
+               directly - the arrays this index writes into (see
+               mp_client_loop_cb_t below) are sized MP_MAX_ALT_PATHS,
+               which is deliberately hardcoded rather than tied to
+               picoquic's internal default (see that constant's own
+               comment) precisely so it won't silently drift out of sync
+               with an upstream change to PICOQUIC_NB_PATH_TARGET. */
+            if (*nb_alt_paths >= MP_MAX_ALT_PATHS) {
                 break;
             }
         }
@@ -206,6 +226,15 @@ static int g_should_exit = 0;
    working one already exists in picoquic's own codebase. */
 static mp_pacer_t g_video_pacer;
 static int g_video_pacer_started = 0;
+/* Counts generated-vs-actually-queued chunks - without this, a send
+   failure (e.g. queue full under congestion) looks identical to success
+   from the app's own output, which is exactly the gap that made an
+   observed throughput shortfall unexplainable on a real run (real
+   hardware showed the video channel landing at ~68% of its 10Mbps
+   target with no signal here to say whether that was network-limited
+   or silently dropped at this layer). */
+static uint64_t g_video_chunks_generated = 0;
+static uint64_t g_video_chunks_queued = 0;
 
 static void mp_client_send_video_if_due(picoquic_cnx_t* cnx, int duration_sec) {
     uint64_t now = picoquic_get_quic_time(picoquic_get_quic_ctx(cnx));
@@ -217,7 +246,8 @@ static void mp_client_send_video_if_due(picoquic_cnx_t* cnx, int duration_sec) {
 
     uint64_t stop_time = g_connection_ready_time + (uint64_t)duration_sec * 1000000ULL;
     if (now >= stop_time) {
-        fprintf(stderr, "mp_traffic: duration elapsed, closing\n");
+        fprintf(stderr, "mp_traffic: duration elapsed, closing (video: %llu/%llu chunks queued)\n",
+            (unsigned long long)g_video_chunks_queued, (unsigned long long)g_video_chunks_generated);
         picoquic_close(cnx, 0);
         return;
     }
@@ -225,7 +255,10 @@ static void mp_client_send_video_if_due(picoquic_cnx_t* cnx, int duration_sec) {
     while (mp_pacer_is_due(&g_video_pacer, now) && now < stop_time) {
         uint8_t chunk[MP_VIDEO_CHUNK_BYTES];
         memset(chunk, 0xAA, sizeof(chunk)); /* filler payload - content doesn't matter, see spec */
-        picoquic_queue_datagram_frame(cnx, sizeof(chunk), chunk);
+        g_video_chunks_generated++;
+        if (picoquic_queue_datagram_frame(cnx, sizeof(chunk), chunk) == 0) {
+            g_video_chunks_queued++;
+        }
         mp_pacer_advance(&g_video_pacer);
     }
 
@@ -294,7 +327,17 @@ static int mp_client_create_additional_path(picoquic_cnx_t* cnx, mp_client_loop_
                 need_to_wait = 1;
                 ret = 0;
             } else {
-                fprintf(stderr, "mp_traffic: probe new path failed, code %d\n", ret);
+                /* A non-retriable failure on ONE path (e.g. a flapping
+                   link at probe time) used to kill the entire run: this
+                   ret propagates through mp_client_loop_cb straight to
+                   picoquic_packet_loop_v2, which treats any nonzero
+                   return as fatal. For a long-running measurement
+                   harness, finishing on fewer paths is strictly better
+                   than aborting outright - log it and degrade instead.
+                   client_alt_state[i] is already 1 (set above), so this
+                   path won't be retried again. */
+                fprintf(stderr, "mp_traffic: probe new path failed, code %d - continuing without it\n", ret);
+                ret = 0;
             }
         } else {
             fprintf(stderr, "mp_traffic: new path added, total paths %d\n", cb_ctx->cnx_client->nb_paths);
@@ -370,6 +413,18 @@ int mp_run_client(mp_config_t* config) {
         return -1;
     }
 
+    /* picoquic_set_default_congestion_algorithm_by_name silently stores
+       NULL for an unrecognized name - every congestion-control call site
+       inside picoquic guards on non-NULL, so a typo'd -G doesn't crash,
+       it just runs the whole connection with NO congestion control at
+       all while exiting 0 with a complete qlog. For a testbed whose
+       purpose is comparing CC algorithms, that's silent measurement
+       corruption - check the name first via the public lookup API. */
+    if (picoquic_get_congestion_algorithm(config->cc_algo) == NULL) {
+        fprintf(stderr, "mp_traffic: unknown congestion algorithm '%s'\n", config->cc_algo);
+        picoquic_free(quic);
+        return -1;
+    }
     picoquic_set_default_congestion_algorithm_by_name(quic, config->cc_algo);
     picoquic_set_default_multipath_option(quic, 1);
     /* Explicit, generous max_path_id rather than relying on picoquic's
@@ -396,6 +451,7 @@ int mp_run_client(mp_config_t* config) {
     int ret = picoquic_get_server_address(config->server_ip, config->port, &loop_cb.server_address, &is_name);
     if (ret != 0) {
         fprintf(stderr, "mp_traffic: could not resolve server address %s\n", config->server_ip);
+        picoquic_free(quic);
         return -1;
     }
 
@@ -411,6 +467,7 @@ int mp_run_client(mp_config_t* config) {
         (struct sockaddr*)&loop_cb.server_address, picoquic_current_time(), 0, "mp-traffic.test", "h3", 1);
     if (cnx == NULL) {
         fprintf(stderr, "mp_traffic: could not create connection\n");
+        picoquic_free(quic);
         return -1;
     }
 
@@ -419,13 +476,22 @@ int mp_run_client(mp_config_t* config) {
     ret = picoquic_start_client_cnx(cnx);
     if (ret != 0) {
         fprintf(stderr, "mp_traffic: could not start connection\n");
+        picoquic_free(quic);
         return -1;
     }
 
     if (config->path_spec[0] != 0) {
-        mp_parse_client_multipath_config(config->path_spec, loop_cb.client_alt_if,
-            loop_cb.client_alt_address, loop_cb.server_alt_address, &loop_cb.nb_alt_paths,
-            &loop_cb.server_address);
+        /* nb_alt_paths stays 0 on allocation failure inside the parser -
+           for this app that's the difference between the intended
+           multipath run and a silent single-path fallback, so it's worth
+           a hard failure rather than continuing degraded and unnoticed. */
+        if (mp_parse_client_multipath_config(config->path_spec, loop_cb.client_alt_if,
+                loop_cb.client_alt_address, loop_cb.server_alt_address, &loop_cb.nb_alt_paths,
+                &loop_cb.server_address) != 0) {
+            fprintf(stderr, "mp_traffic: could not parse -A path spec '%s'\n", config->path_spec);
+            picoquic_free(quic);
+            return -1;
+        }
     }
     loop_cb.cnx_client = cnx;
 
@@ -455,6 +521,10 @@ int mp_run_client(mp_config_t* config) {
 
 static mp_pacer_t g_control_pacer;
 static int g_control_pacer_started = 0;
+/* Same generated-vs-queued accounting as the video side - see the
+   comment on g_video_chunks_generated/g_video_chunks_queued. */
+static uint64_t g_control_chunks_generated = 0;
+static uint64_t g_control_chunks_queued = 0;
 
 static void mp_server_send_control_if_due(picoquic_cnx_t* cnx, int duration_sec) {
     uint64_t now = picoquic_get_quic_time(picoquic_get_quic_ctx(cnx));
@@ -462,12 +532,17 @@ static void mp_server_send_control_if_due(picoquic_cnx_t* cnx, int duration_sec)
     if (!g_control_pacer_started) {
         mp_pacer_init(&g_control_pacer, now, MP_CONTROL_CHUNK_BYTES, MP_CONTROL_TARGET_BPS);
         g_control_pacer_started = 1;
-        picoquic_mark_active_stream(cnx, MP_CONTROL_STREAM_ID, 1, NULL);
+        /* No picoquic_mark_active_stream call here - picoquic.h documents
+           that picoquic_add_to_stream (below) automatically supersedes
+           any active-stream mark, and there's no
+           picoquic_callback_prepare_to_send handler in this app for it
+           to matter to, so the call was dead code. */
     }
 
     uint64_t stop_time = g_connection_ready_time + (uint64_t)duration_sec * 1000000ULL;
     if (now >= stop_time) {
-        fprintf(stderr, "mp_traffic: duration elapsed, closing\n");
+        fprintf(stderr, "mp_traffic: duration elapsed, closing (control: %llu/%llu chunks queued)\n",
+            (unsigned long long)g_control_chunks_queued, (unsigned long long)g_control_chunks_generated);
         picoquic_close(cnx, 0);
         return;
     }
@@ -475,7 +550,10 @@ static void mp_server_send_control_if_due(picoquic_cnx_t* cnx, int duration_sec)
     while (mp_pacer_is_due(&g_control_pacer, now) && now < stop_time) {
         uint8_t chunk[MP_CONTROL_CHUNK_BYTES];
         memset(chunk, 0xBB, sizeof(chunk)); /* filler payload */
-        picoquic_add_to_stream(cnx, MP_CONTROL_STREAM_ID, chunk, sizeof(chunk), 0);
+        g_control_chunks_generated++;
+        if (picoquic_add_to_stream(cnx, MP_CONTROL_STREAM_ID, chunk, sizeof(chunk), 0) == 0) {
+            g_control_chunks_queued++;
+        }
         mp_pacer_advance(&g_control_pacer);
     }
 
@@ -546,7 +624,15 @@ int mp_run_server(mp_config_t* config) {
        picoquic's default cert/key path (certs/cert.pem) is relative to
        process cwd, only exists under picoquic/certs/ - this binary must
        be run from inside picoquic/, or pass explicit cert/key paths. */
-    picoquic_quic_t* quic = picoquic_create(8, "certs/cert.pem", "certs/key.pem", NULL, "h3",
+    /* Connection cap of 1, not 8: g_connection_ready_time, g_control_pacer
+       and g_should_exit are process-wide globals (this app is a one-shot
+       single-connection traffic generator, not a real multi-client
+       server - see the spec's stated scope), so a second concurrent
+       connection would find the control pacer already "started" and
+       burst-flush stale state, and one connection's close would
+       terminate the packet loop out from under the other. Enforcing the
+       limit here makes that constraint real instead of assumed. */
+    picoquic_quic_t* quic = picoquic_create(1, "certs/cert.pem", "certs/key.pem", NULL, "h3",
         mp_server_callback, config, NULL, NULL, NULL,
         picoquic_current_time(), NULL, NULL, NULL, 0);
     if (quic == NULL) {
@@ -554,6 +640,11 @@ int mp_run_server(mp_config_t* config) {
         return -1;
     }
 
+    if (picoquic_get_congestion_algorithm(config->cc_algo) == NULL) {
+        fprintf(stderr, "mp_traffic: unknown congestion algorithm '%s'\n", config->cc_algo);
+        picoquic_free(quic);
+        return -1;
+    }
     picoquic_set_default_congestion_algorithm_by_name(quic, config->cc_algo);
     picoquic_set_default_multipath_option(quic, 1);
     /* Same explicit max_path_id fix as the client - don't rely on
