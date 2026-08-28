@@ -16,6 +16,10 @@
 # safety-net timeout (duration + 30s) is sized for the run alone and would
 # otherwise time out waiting for the next client connection while this
 # script is still busy pinging from the previous iteration.
+# Set SKIP_QLOG=1 to omit qlog output - qlog size scales with duration
+# (a 30s run produces ~30-37MB; an hour-long run would be ~120x that,
+# multiple GB per run), so long runs where you only need the delivery
+# counters/NIC byte deltas should skip it.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 source env.sh
@@ -25,12 +29,19 @@ duration="${2:-30}"
 ts="$(date +%Y%m%d_%H%M%S)"
 qlog_dir="qlogs_mptraffic/client_${cc}_${ts}"
 log_file="results/mptraffic_client_${cc}_${ts}.log"
+qlog_args=()
+if [ "${SKIP_QLOG:-0}" != "1" ]; then
+  qlog_args=(-q "../$qlog_dir")
+fi
 
 idx() { ip -o link show "$1" | cut -d: -f1 | tr -d ' '; }
 IDX_B=$(idx "$CLIENT_IFACE_B")
 IDX_C=$(idx "$CLIENT_IFACE_C")
 
-mkdir -p "$qlog_dir" results
+mkdir -p results
+if [ "${SKIP_QLOG:-0}" != "1" ]; then
+  mkdir -p "$qlog_dir"
+fi
 
 rx_bytes() { cat "/sys/class/net/$1/statistics/rx_bytes"; }
 tx_bytes() { cat "/sys/class/net/$1/statistics/tx_bytes"; }
@@ -43,7 +54,7 @@ tx_bytes() { cat "/sys/class/net/$1/statistics/tx_bytes"; }
   done
 
   ( cd traffic-app && exec ./mp_traffic -A "${LINK_B_CLIENT_IP}/${IDX_B},${LINK_C_CLIENT_IP}/${IDX_C}" \
-      -G "$cc" --duration "$duration" -q "../$qlog_dir" "$SERVER_CANONICAL_IP" "$QUIC_PORT" )
+      -G "$cc" --duration "$duration" "${qlog_args[@]}" "$SERVER_CANONICAL_IP" "$QUIC_PORT" )
 
   echo "=== path byte counters AFTER run ==="
   for label_iface in "A:$CLIENT_IFACE_A" "B:$CLIENT_IFACE_B" "C:$CLIENT_IFACE_C"; do
