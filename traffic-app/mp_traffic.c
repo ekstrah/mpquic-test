@@ -3,6 +3,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <getopt.h>
+#include <signal.h>
 #include "picoquic.h"
 #include "picoquic_utils.h"
 #include "picoquic_packet_loop.h"
@@ -212,8 +213,26 @@ static uint64_t g_connection_ready_time = 0;
    closing the QUIC connection (picoquic_close) does not by itself stop
    picoquic_packet_loop_v2's socket loop - confirmed against picoquic's
    own sockloop.c, whose main loop only exits when a loop_callback
-   returns a nonzero ret; there is no automatic exit-on-disconnect. */
-static int g_should_exit = 0;
+   returns a nonzero ret; there is no automatic exit-on-disconnect.
+   Also set from mp_handle_sigint below, so it must be signal-safe:
+   volatile sig_atomic_t, not plain int. */
+static volatile sig_atomic_t g_should_exit = 0;
+
+/* picoquic itself installs no signal handlers (confirmed: no signal()/
+   sigaction() anywhere in sockloop.c or picoquicdemo.c) - SIGINT's
+   default action just terminates the process, identically to SIGTERM,
+   with no qlog flush either way. run-traffic-server.sh wraps this
+   binary in `timeout -s INT` specifically so a stuck run's safety-net
+   timeout gets a graceful shutdown instead of a bare kill; without this
+   handler that comment would be describing behavior the code doesn't
+   actually have. Routing SIGINT through the same g_should_exit flag
+   both loop callbacks already check makes Ctrl-C during interactive use
+   graceful too (closes the connection, flushes qlog) instead of an
+   abrupt kill. */
+static void mp_handle_sigint(int sig) {
+    (void)sig;
+    g_should_exit = 1;
+}
 
 /* Video-like traffic generator: client -> server, via QUIC datagrams
    (RFC 9221), constant-bitrate. Datagrams are chosen deliberately over a
@@ -226,13 +245,20 @@ static int g_should_exit = 0;
    working one already exists in picoquic's own codebase. */
 static mp_pacer_t g_video_pacer;
 static int g_video_pacer_started = 0;
-/* Counts generated-vs-actually-queued chunks - without this, a send
-   failure (e.g. queue full under congestion) looks identical to success
-   from the app's own output, which is exactly the gap that made an
-   observed throughput shortfall unexplainable on a real run (real
-   hardware showed the video channel landing at ~68% of its 10Mbps
-   target with no signal here to say whether that was network-limited
-   or silently dropped at this layer). */
+/* Counts generated-vs-successfully-enqueued chunks. This is NOT a
+   delivery signal: picoquic_queue_datagram_frame appends to an
+   UNBOUNDED malloc'd list (confirmed against real picoquic source,
+   picoquic_queue_misc_or_dg_frame in quicctx.c) - there is no "queue
+   full" failure mode to catch under congestion, so a slow-draining
+   connection just grows the backlog rather than rejecting new chunks,
+   and this counter reads ~100% either way. The only real failures it
+   catches are PICOQUIC_ERROR_DATAGRAM_TOO_LONG (chunk exceeds the
+   negotiated/path MTU) and allocation failure. Real hardware runs
+   confirmed this the hard way: BBR showed 100% here while client-side
+   NIC TX bytes measured only ~28% of the 10Mbps target for that run -
+   the NIC byte-counter deltas in run-traffic-client.sh remain the only
+   trustworthy on-wire delivery signal, same as this project's
+   methodology everywhere else. */
 static uint64_t g_video_chunks_generated = 0;
 static uint64_t g_video_chunks_queued = 0;
 
@@ -481,13 +507,17 @@ int mp_run_client(mp_config_t* config) {
     }
 
     if (config->path_spec[0] != 0) {
-        /* nb_alt_paths stays 0 on allocation failure inside the parser -
-           for this app that's the difference between the intended
-           multipath run and a silent single-path fallback, so it's worth
-           a hard failure rather than continuing degraded and unnoticed. */
+        /* The parser's own return value only signals malloc failure -
+           an invalid entry (bad IP, address-family mismatch) is silently
+           skipped internally, leaving ret==0 with nb_alt_paths still 0.
+           Checking nb_alt_paths too is what actually catches "the whole
+           -A spec was garbage" instead of only the OOM case - for this
+           app that distinction is the difference between the intended
+           multipath run and a silent single-path fallback, worth a hard
+           failure rather than continuing degraded and unnoticed. */
         if (mp_parse_client_multipath_config(config->path_spec, loop_cb.client_alt_if,
                 loop_cb.client_alt_address, loop_cb.server_alt_address, &loop_cb.nb_alt_paths,
-                &loop_cb.server_address) != 0) {
+                &loop_cb.server_address) != 0 || loop_cb.nb_alt_paths == 0) {
             fprintf(stderr, "mp_traffic: could not parse -A path spec '%s'\n", config->path_spec);
             picoquic_free(quic);
             return -1;
@@ -693,6 +723,7 @@ int main(int argc, char** argv) {
        safety check, it surfaced this pre-existing bug immediately by
        rejecting the very first run. */
     picoquic_register_all_congestion_control_algorithms();
+    signal(SIGINT, mp_handle_sigint);
 
     if (config.is_server) {
         return mp_run_server(&config);
