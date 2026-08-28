@@ -317,10 +317,18 @@ static int mp_client_loop_cb(picoquic_quic_t* quic, picoquic_packet_loop_cb_enum
     case picoquic_packet_loop_ready: {
         picoquic_packet_loop_options_t* options = (picoquic_packet_loop_options_t*)callback_arg;
         options->provide_alt_port = 1;
-        options->do_time_check = 1;
         break;
     }
-    case picoquic_packet_loop_time_check:
+    case picoquic_packet_loop_after_send:
+        /* The only loop_callback event whose return value reliably
+           survives to the outer loop's exit check - confirmed against
+           real sockloop.c: picoquic_packet_loop_time_check's ret gets
+           unconditionally overwritten by the timeout/qmux-check handling
+           that runs right after it in the same iteration, so a
+           termination request made there was silently discarded on
+           every tick (that's why the previous fix compiled and ran but
+           never actually exited). after_send is called last, once
+           per iteration, with nothing after it to clobber ret. */
         if (g_should_exit) {
             ret = PICOQUIC_NO_ERROR_TERMINATE_PACKET_LOOP;
         }
@@ -517,12 +525,12 @@ static int mp_server_loop_cb(picoquic_quic_t* quic, picoquic_packet_loop_cb_enum
     (void)quic; (void)callback_ctx; (void)callback_arg;
 
     switch (cb_mode) {
-    case picoquic_packet_loop_ready: {
-        picoquic_packet_loop_options_t* options = (picoquic_packet_loop_options_t*)callback_arg;
-        options->do_time_check = 1;
-        break;
-    }
-    case picoquic_packet_loop_time_check:
+    case picoquic_packet_loop_after_send:
+        /* after_send is the only loop_callback event whose return value
+           reliably survives to the outer loop's exit check - see the
+           matching comment on mp_client_loop_cb for why time_check
+           doesn't work (its ret gets clobbered by the timeout/qmux-check
+           handling in the same iteration). */
         if (g_should_exit) {
             ret = PICOQUIC_NO_ERROR_TERMINATE_PACKET_LOOP;
         }
