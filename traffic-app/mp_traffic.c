@@ -290,8 +290,16 @@ int mp_run_client(mp_config_t* config) {
         return -1;
     }
 
+    /* ALPN "h3" (not a custom string) so this client can validate against
+       the existing picoquicdemo server in Task 3's test - ALPN negotiation
+       fails the handshake immediately if the client's offered protocol
+       isn't in the server's supported list, and picoquicdemo only
+       supports h3. Kept as h3 for the app's own server too (Task 4) rather
+       than switching to a custom ALPN there and back - the string itself
+       is just an identifier both sides need to agree on, nothing in this
+       app depends on HTTP/3 semantics. */
     picoquic_cnx_t* cnx = picoquic_create_cnx(quic, picoquic_null_connection_id, picoquic_null_connection_id,
-        (struct sockaddr*)&loop_cb.server_address, picoquic_current_time(), 0, "mp-traffic.test", "mp-traffic", 1);
+        (struct sockaddr*)&loop_cb.server_address, picoquic_current_time(), 0, "mp-traffic.test", "h3", 1);
     if (cnx == NULL) {
         fprintf(stderr, "mp_traffic: could not create connection\n");
         return -1;
