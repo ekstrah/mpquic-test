@@ -213,7 +213,19 @@ static int mp_client_create_additional_path(picoquic_cnx_t* cnx, mp_client_loop_
         if (ret != 0) {
             if (ret == PICOQUIC_ERROR_PATH_ID_BLOCKED ||
                 ret == PICOQUIC_ERROR_PATH_CID_BLOCKED ||
-                ret == PICOQUIC_ERROR_PATH_NOT_READY) {
+                ret == PICOQUIC_ERROR_PATH_NOT_READY ||
+                ret == PICOQUIC_ERROR_MEMORY) {
+                /* PICOQUIC_ERROR_MEMORY here is not a real allocation
+                   failure - traced through picoquic_create_path ->
+                   picoquic_find_avalaible_unique_path_id, which returns
+                   this generic code when max_path_id_in_cnxid_lists blocks
+                   it too, a value that grows dynamically as the peer's
+                   NEW_CONNECTION_ID frames actually arrive rather than a
+                   static negotiated limit. Reproducibly hit on the 2nd
+                   extra path even after raising initial_max_path_id on
+                   both sides, consistent with "not enough CIDs have
+                   arrived yet" rather than a hard cap - retrying gives
+                   the connection more round trips to receive them. */
                 cb_ctx->client_alt_state[i] = 0;
                 need_to_wait = 1;
                 ret = 0;
