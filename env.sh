@@ -52,6 +52,16 @@ LINK_C_DELAY_MS=20
 LINK_C_JITTER_MS=8
 LINK_C_LOSS_PCT=0.5
 
+# --- sweep: every CC algorithm this picoquic build registers (confirmed
+# via `picoquicdemo -h`'s dynamically-generated -G list, not guessed from
+# source filenames - scone/dualq_aqm exist as source files but aren't
+# actually wired into this build's selectable list). picoquic has no
+# swappable scheduler (Phase 0 finding), so unlike the TQUIC sweep this is
+# 1-dimensional (CC only), not scheduler x CC. ---
+SWEEP_CC_LIST=(newreno cubic dcubic fast bbr prague bbr1 c4)
+SWEEP_WINDOW_SEC=30          # per-combo slot length on the SERVER side
+SWEEP_CLIENT_DELAY_SEC=5     # CLIENT startup delay, lets the fresh server come up
+
 # NOTE: this file is the same on both boxes at clone time. Only the three
 # *_IFACE_* lines for your box differ in practice (net-server.sh only
 # reads SERVER_IFACE_*, net-client.sh only reads CLIENT_IFACE_*), so
