@@ -261,6 +261,19 @@ static int g_video_pacer_started = 0;
    methodology everywhere else. */
 static uint64_t g_video_chunks_generated = 0;
 static uint64_t g_video_chunks_queued = 0;
+/* Real, automatic delivery accounting: picoquic fires these on the same
+   connection callback (cnx->callback_fn) whenever a packet carrying a
+   previously-queued datagram frame is confirmed ACKed, presumed lost, or
+   a presumed-lost one turns out to have arrived after all (spurious loss
+   detection, e.g. reordering) - confirmed against real picoquic source
+   (frames.c for acked/spurious, loss_recovery.c for lost). No opt-in
+   flag or special queuing call needed - just handling the event types
+   below, which this app previously fell through to `default: break`
+   for. Net confirmed-lost = lost - spurious (a spurious mark means the
+   earlier "lost" call for that same frame was a false positive). */
+static uint64_t g_video_chunks_acked = 0;
+static uint64_t g_video_chunks_lost = 0;
+static uint64_t g_video_chunks_spurious = 0;
 
 static void mp_client_send_video_if_due(picoquic_cnx_t* cnx, int duration_sec) {
     uint64_t now = picoquic_get_quic_time(picoquic_get_quic_ctx(cnx));
@@ -272,8 +285,14 @@ static void mp_client_send_video_if_due(picoquic_cnx_t* cnx, int duration_sec) {
 
     uint64_t stop_time = g_connection_ready_time + (uint64_t)duration_sec * 1000000ULL;
     if (now >= stop_time) {
-        fprintf(stderr, "mp_traffic: duration elapsed, closing (video: %llu/%llu chunks queued)\n",
-            (unsigned long long)g_video_chunks_queued, (unsigned long long)g_video_chunks_generated);
+        uint64_t confirmed_lost = (g_video_chunks_lost > g_video_chunks_spurious) ?
+            g_video_chunks_lost - g_video_chunks_spurious : 0;
+        fprintf(stderr, "mp_traffic: duration elapsed, closing (video: %llu/%llu chunks queued, "
+            "%llu acked, %llu confirmed lost, %llu still unresolved at close)\n",
+            (unsigned long long)g_video_chunks_queued, (unsigned long long)g_video_chunks_generated,
+            (unsigned long long)g_video_chunks_acked, (unsigned long long)confirmed_lost,
+            (unsigned long long)(g_video_chunks_queued > g_video_chunks_acked + confirmed_lost ?
+                g_video_chunks_queued - g_video_chunks_acked - confirmed_lost : 0));
         picoquic_close(cnx, 0);
         return;
     }
@@ -305,6 +324,15 @@ static int mp_client_callback(picoquic_cnx_t* cnx, uint64_t stream_id, uint8_t* 
         break;
     case picoquic_callback_app_wakeup:
         mp_client_send_video_if_due(cnx, ((mp_config_t*)callback_ctx)->duration_sec);
+        break;
+    case picoquic_callback_datagram_acked:
+        g_video_chunks_acked++;
+        break;
+    case picoquic_callback_datagram_lost:
+        g_video_chunks_lost++;
+        break;
+    case picoquic_callback_datagram_spurious:
+        g_video_chunks_spurious++;
         break;
     case picoquic_callback_close:
     case picoquic_callback_application_close:
