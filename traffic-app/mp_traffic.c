@@ -6,8 +6,17 @@
 #include "picoquic.h"
 #include "picoquic_utils.h"
 #include "picoquic_packet_loop.h"
+#include "picoquic_internal.h" /* opaque picoquic_cnx_t in picoquic.h hides
+    the fields (nb_paths, is_multipath_enabled, ...) this file needs to
+    read directly - picoquicdemo.c includes this same internal header for
+    the identical reason, since it's part of the same source tree rather
+    than a true external API consumer. */
 
-#define MP_MAX_ALT_PATHS PICOQUIC_NB_PATH_TARGET
+#define MP_MAX_ALT_PATHS 8 /* matches picoquic's own PICOQUIC_NB_PATH_TARGET
+    default (picoquic_internal.h) - hardcoded rather than referencing that
+    macro directly, since this array-sizing constant doesn't need to track
+    picoquic's internal default if it ever changes; 8 is generous headroom
+    for this rig's 3 links either way. */
 
 typedef struct st_mp_config_t {
     int is_server;
