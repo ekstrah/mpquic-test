@@ -282,6 +282,13 @@ int mp_run_client(mp_config_t* config) {
 
     picoquic_set_default_congestion_algorithm_by_name(quic, config->cc_algo);
     picoquic_set_default_multipath_option(quic, 1);
+    /* Explicit, generous max_path_id rather than relying on picoquic's
+       built-in default - Task 3's real-hardware test showed the foreign
+       picoquicdemo peer's default capped us at 2 total paths (this app's
+       own max_path_id_remote limit comes from the OTHER side's setting,
+       so this call matters most on whichever side is the SERVER, but set
+       symmetrically here too in case roles ever reverse). */
+    picoquic_set_default_tp_value(quic, picoquic_tp_initial_max_path_id, MP_MAX_ALT_PATHS);
 
     int is_name = 0;
     int ret = picoquic_get_server_address(config->server_ip, config->port, &loop_cb.server_address, &is_name);
@@ -334,6 +341,62 @@ int mp_run_client(mp_config_t* config) {
     return ret;
 }
 
+/* --- Server connection setup. Confirmed against real picoquicdemo.c
+   source that the server side needs no equivalent of the client's
+   path-probing/driving logic - multipath path validation on accept is
+   handled entirely inside the picoquic library engine, no application
+   involvement required. This is genuinely simpler than Task 3's client
+   side, not just simplified for this app's purposes. */
+static int mp_server_callback(picoquic_cnx_t* cnx, uint64_t stream_id, uint8_t* bytes,
+    size_t length, picoquic_call_back_event_t event, void* callback_ctx, void* v_stream_ctx) {
+    (void)stream_id; (void)bytes; (void)length; (void)callback_ctx; (void)v_stream_ctx;
+
+    switch (event) {
+    case picoquic_callback_ready:
+        g_connection_ready_time = picoquic_get_quic_time(picoquic_get_quic_ctx(cnx));
+        fprintf(stderr, "mp_traffic: server sees connection ready at %llu\n",
+            (unsigned long long)g_connection_ready_time);
+        break;
+    case picoquic_callback_close:
+    case picoquic_callback_application_close:
+        fprintf(stderr, "mp_traffic: server sees connection closed\n");
+        break;
+    default:
+        break;
+    }
+    return 0;
+}
+
+int mp_run_server(mp_config_t* config) {
+    /* Same cert path constraint discovered in the sweep harness (Phase 2):
+       picoquic's default cert/key path (certs/cert.pem) is relative to
+       process cwd, only exists under picoquic/certs/ - this binary must
+       be run from inside picoquic/, or pass explicit cert/key paths. */
+    picoquic_quic_t* quic = picoquic_create(8, "certs/cert.pem", "certs/key.pem", NULL, "h3",
+        mp_server_callback, config, NULL, NULL, NULL,
+        picoquic_current_time(), NULL, NULL, NULL, 0);
+    if (quic == NULL) {
+        fprintf(stderr, "mp_traffic: could not create server quic context\n");
+        return -1;
+    }
+
+    picoquic_set_default_congestion_algorithm_by_name(quic, config->cc_algo);
+    picoquic_set_default_multipath_option(quic, 1);
+    /* Same explicit max_path_id fix as the client - don't rely on
+       picoquic's built-in default, which Task 3's real-hardware test
+       showed can be as low as 2 total paths against a foreign peer. */
+    picoquic_set_default_tp_value(quic, picoquic_tp_initial_max_path_id, MP_MAX_ALT_PATHS);
+
+    picoquic_packet_loop_param_t param;
+    memset(&param, 0, sizeof(param));
+    param.local_port = config->port;
+
+    int ret = picoquic_packet_loop_v2(quic, &param, NULL, NULL);
+
+    picoquic_free(quic);
+    return ret;
+}
+
 int main(int argc, char** argv) {
     mp_config_t config;
     if (mp_parse_args(argc, argv, &config) != 0) {
@@ -341,8 +404,7 @@ int main(int argc, char** argv) {
     }
 
     if (config.is_server) {
-        printf("server mode: port=%d cc=%s\n", config.port, config.cc_algo);
-        return 0; /* server connection setup added in Task 4 */
+        return mp_run_server(&config);
     } else {
         return mp_run_client(&config);
     }
