@@ -59,10 +59,12 @@ LINK_C_LOSS_PCT=0.5
 # swappable scheduler (Phase 0 finding), so unlike the TQUIC sweep this is
 # 1-dimensional (CC only), not scheduler x CC. ---
 SWEEP_CC_LIST=(newreno cubic dcubic fast bbr prague bbr1 c4)
-SWEEP_WINDOW_SEC=60          # SAFETY-NET timeout only (server waits for the
+SWEEP_WINDOW_SEC=180         # SAFETY-NET timeout only (server waits for the
                              # actual connection to close via -1, doesn't
                              # sleep this long normally - see run-server-sweep.sh).
-                             # Generous since it's cost-free in the normal path.
+                             # Generous since it's cost-free in the normal path -
+                             # sized to cover BBR's worst observed case (~1.3Mbps)
+                             # even at a 20MB file (~123s worst case).
 SWEEP_CLIENT_DELAY_SEC=5     # CLIENT startup delay, lets the fresh server come up
 
 # NOTE: this file is the same on both boxes at clone time. Only the three
