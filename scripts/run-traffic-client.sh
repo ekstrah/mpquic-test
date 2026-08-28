@@ -11,6 +11,11 @@
 #     <src_ip>` pattern verify-link.sh already uses for link
 #     characterization - taken right after the run (not concurrent with
 #     it, so it doesn't add load on top of the measurement itself)
+# Set SKIP_PING=1 to omit the ~60s ping phase - needed when looping this
+# script over several CC algorithms back-to-back, since run-traffic-server.sh's
+# safety-net timeout (duration + 30s) is sized for the run alone and would
+# otherwise time out waiting for the next client connection while this
+# script is still busy pinging from the previous iteration.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 source env.sh
@@ -46,10 +51,12 @@ tx_bytes() { cat "/sys/class/net/$1/statistics/tx_bytes"; }
     echo "  Link $label ($iface): rx=$(rx_bytes "$iface") tx=$(tx_bytes "$iface")"
   done
 
-  echo "=== post-run per-path latency/loss (ping, 20 packets each) ==="
-  for label_srcip in "A:$LINK_A_CLIENT_IP" "B:$LINK_B_CLIENT_IP" "C:$LINK_C_CLIENT_IP"; do
-    label="${label_srcip%%:*}"; src="${label_srcip##*:}"
-    echo "-- Link $label (src $src) --"
-    ping -c 20 -I "$src" "$SERVER_CANONICAL_IP" || true
-  done
+  if [ "${SKIP_PING:-0}" != "1" ]; then
+    echo "=== post-run per-path latency/loss (ping, 20 packets each) ==="
+    for label_srcip in "A:$LINK_A_CLIENT_IP" "B:$LINK_B_CLIENT_IP" "C:$LINK_C_CLIENT_IP"; do
+      label="${label_srcip%%:*}"; src="${label_srcip##*:}"
+      echo "-- Link $label (src $src) --"
+      ping -c 20 -I "$src" "$SERVER_CANONICAL_IP" || true
+    done
+  fi
 } 2>&1 | tee "$log_file"
