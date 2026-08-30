@@ -35,10 +35,13 @@ typedef struct st_mp_config_t {
     char cc_algo[32];
     int duration_sec;
     char qlog_dir[256];    /* empty = no qlog, matching picoquicdemo's -q */
+    int control_datagram;  /* 0 = server->client control channel uses a
+        reliable stream (original behavior), 1 = it uses DATAGRAM frames
+        instead, same as the client->video channel - see --control-datagram */
 } mp_config_t;
 
 static void mp_usage(const char* prog) {
-    fprintf(stderr, "Server: %s -p <port> [-G <cc_algo>] [-q <qlog_dir>]\n", prog);
+    fprintf(stderr, "Server: %s -p <port> [-G <cc_algo>] [-q <qlog_dir>] [--control-datagram]\n", prog);
     fprintf(stderr, "Client: %s -A <path_spec> [-G <cc_algo>] [-q <qlog_dir>] --duration <seconds> <server_ip> <port>\n", prog);
 }
 
@@ -54,6 +57,7 @@ int mp_parse_args(int argc, char** argv, mp_config_t* config) {
        app uses the system getopt_long instead. */
     static struct option long_opts[] = {
         {"duration", required_argument, 0, 'd'},
+        {"control-datagram", no_argument, 0, 'C'},
         {0, 0, 0, 0}
     };
 
@@ -74,6 +78,9 @@ int mp_parse_args(int argc, char** argv, mp_config_t* config) {
             break;
         case 'd':
             config->duration_sec = atoi(optarg);
+            break;
+        case 'C':
+            config->control_datagram = 1;
             break;
         default:
             mp_usage(argv[0]);
@@ -567,15 +574,21 @@ int mp_run_client(mp_config_t* config) {
     return ret;
 }
 
-/* Control-like traffic generator: server -> client, on a regular
-   reliable QUIC stream (not a datagram) - control commands need
+/* Control-like traffic generator: server -> client. Originally always a
+   regular reliable QUIC stream (not a datagram) - control commands need
    ordering/reliability that a datagram doesn't provide, the opposite
-   tradeoff from the video-like traffic in Task 5. Same pacer module,
-   same CBR approach, picoquic_add_to_stream instead of
-   picoquic_queue_datagram_frame. */
+   tradeoff from the video-like traffic in Task 5. --control-datagram
+   switches this channel to picoquic_queue_datagram_frame instead, same
+   call the client's video channel uses - added to test whether the
+   RETIRE_CONNECTION_ID/PROTOCOL_VIOLATION race (see migration-report.md)
+   depends on STREAM frames being present at all: with this flag set, the
+   connection carries zero STREAM frames post-handshake in either
+   direction, isolating the path/CID-layer mechanism from frame-type
+   content as a variable. Same pacer module, same CBR approach either way. */
 #define MP_CONTROL_CHUNK_BYTES 125
 #define MP_CONTROL_TARGET_BPS 1000000ULL
-#define MP_CONTROL_STREAM_ID 1 /* server-initiated bidirectional stream */
+#define MP_CONTROL_STREAM_ID 1 /* server-initiated bidirectional stream,
+    only used when control_datagram is 0 */
 
 static mp_pacer_t g_control_pacer;
 static int g_control_pacer_started = 0;
@@ -583,8 +596,13 @@ static int g_control_pacer_started = 0;
    comment on g_video_chunks_generated/g_video_chunks_queued. */
 static uint64_t g_control_chunks_generated = 0;
 static uint64_t g_control_chunks_queued = 0;
+/* Only populated when control_datagram is set - stream sends have no
+   equivalent acked/lost/spurious callback events in this app. */
+static uint64_t g_control_chunks_acked = 0;
+static uint64_t g_control_chunks_lost = 0;
+static uint64_t g_control_chunks_spurious = 0;
 
-static void mp_server_send_control_if_due(picoquic_cnx_t* cnx, int duration_sec) {
+static void mp_server_send_control_if_due(picoquic_cnx_t* cnx, int duration_sec, int control_datagram) {
     uint64_t now = picoquic_get_quic_time(picoquic_get_quic_ctx(cnx));
 
     if (!g_control_pacer_started) {
@@ -599,8 +617,19 @@ static void mp_server_send_control_if_due(picoquic_cnx_t* cnx, int duration_sec)
 
     uint64_t stop_time = g_connection_ready_time + (uint64_t)duration_sec * 1000000ULL;
     if (now >= stop_time) {
-        fprintf(stderr, "mp_traffic: duration elapsed, closing (control: %llu/%llu chunks queued)\n",
-            (unsigned long long)g_control_chunks_queued, (unsigned long long)g_control_chunks_generated);
+        if (control_datagram) {
+            uint64_t confirmed_lost = (g_control_chunks_lost > g_control_chunks_spurious) ?
+                g_control_chunks_lost - g_control_chunks_spurious : 0;
+            fprintf(stderr, "mp_traffic: duration elapsed, closing (control: %llu/%llu chunks queued, "
+                "%llu acked, %llu confirmed lost, %llu still unresolved at close)\n",
+                (unsigned long long)g_control_chunks_queued, (unsigned long long)g_control_chunks_generated,
+                (unsigned long long)g_control_chunks_acked, (unsigned long long)confirmed_lost,
+                (unsigned long long)(g_control_chunks_queued > g_control_chunks_acked + confirmed_lost ?
+                    g_control_chunks_queued - g_control_chunks_acked - confirmed_lost : 0));
+        } else {
+            fprintf(stderr, "mp_traffic: duration elapsed, closing (control: %llu/%llu chunks queued)\n",
+                (unsigned long long)g_control_chunks_queued, (unsigned long long)g_control_chunks_generated);
+        }
         picoquic_close(cnx, 0);
         return;
     }
@@ -609,7 +638,10 @@ static void mp_server_send_control_if_due(picoquic_cnx_t* cnx, int duration_sec)
         uint8_t chunk[MP_CONTROL_CHUNK_BYTES];
         memset(chunk, 0xBB, sizeof(chunk)); /* filler payload */
         g_control_chunks_generated++;
-        if (picoquic_add_to_stream(cnx, MP_CONTROL_STREAM_ID, chunk, sizeof(chunk), 0) == 0) {
+        int queued = control_datagram ?
+            (picoquic_queue_datagram_frame(cnx, sizeof(chunk), chunk) == 0) :
+            (picoquic_add_to_stream(cnx, MP_CONTROL_STREAM_ID, chunk, sizeof(chunk), 0) == 0);
+        if (queued) {
             g_control_chunks_queued++;
         }
         mp_pacer_advance(&g_control_pacer);
@@ -634,10 +666,21 @@ static int mp_server_callback(picoquic_cnx_t* cnx, uint64_t stream_id, uint8_t* 
         g_connection_ready_time = picoquic_get_quic_time(picoquic_get_quic_ctx(cnx));
         fprintf(stderr, "mp_traffic: server sees connection ready at %llu\n",
             (unsigned long long)g_connection_ready_time);
-        mp_server_send_control_if_due(cnx, ((mp_config_t*)callback_ctx)->duration_sec);
+        mp_server_send_control_if_due(cnx, ((mp_config_t*)callback_ctx)->duration_sec,
+            ((mp_config_t*)callback_ctx)->control_datagram);
         break;
     case picoquic_callback_app_wakeup:
-        mp_server_send_control_if_due(cnx, ((mp_config_t*)callback_ctx)->duration_sec);
+        mp_server_send_control_if_due(cnx, ((mp_config_t*)callback_ctx)->duration_sec,
+            ((mp_config_t*)callback_ctx)->control_datagram);
+        break;
+    case picoquic_callback_datagram_acked:
+        g_control_chunks_acked++;
+        break;
+    case picoquic_callback_datagram_lost:
+        g_control_chunks_lost++;
+        break;
+    case picoquic_callback_datagram_spurious:
+        g_control_chunks_spurious++;
         break;
     case picoquic_callback_close:
     case picoquic_callback_application_close:
